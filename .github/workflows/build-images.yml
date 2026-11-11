@@ -125,7 +125,7 @@ jobs:
 
       # 1. build into the local image store only (fills the registry cache)
       - name: Build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ env.DIR }}
           file: ${{ env.DIR }}/Containerfile
@@ -151,7 +151,7 @@ jobs:
       # 3. push (all layers come from the build cache)
       - name: Push
         if: env.PUSH == 'true'
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ env.DIR }}
           file: ${{ env.DIR }}/Containerfile
