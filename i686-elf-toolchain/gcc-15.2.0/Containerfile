@@ -1,0 +1,177 @@
+# syntax=docker/dockerfile:1
+
+ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:78d4744ead1f5b19b04d0df558ab182a5300903900755e515b2ca4d10eb2044d
+
+FROM --platform=linux/amd64 ${UBUNTU_IMAGE} AS builder
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG GCC_VERSION=15.2.0
+ARG BINUTILS_VERSION=2.45.1
+ARG GCC_SHA512=89047a2e07bd9da265b507b516ed3635adb17491c7f4f67cf090f0bd5b3fc7f2ee6e4cc4008beef7ca884b6b71dffe2bb652b21f01a702e17b468cca2d10b2de
+ARG BINUTILS_SHA512=ea030419eba387579ab717be7e3223fc99e93b586860b06003c12489f93441640d4082736f76aa5e98233db4f46e232f536a45e471486de1f5b64e1b827c167e
+
+ENV PREFIX=/opt/cross \
+    TARGET=i686-elf \
+    PATH=/opt/cross/bin:${PATH}
+
+WORKDIR /root/src
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        bison \
+        build-essential \
+        ca-certificates \
+        flex \
+        gawk \
+        libgmp-dev \
+        libisl-dev \
+        libmpc-dev \
+        libmpfr-dev \
+        libzstd-dev \
+        tar \
+        texinfo \
+        wget \
+        xz-utils \
+        zlib1g-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    wget --https-only --tries=5 --progress=dot:giga \
+        "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz" \
+        -O "gcc-${GCC_VERSION}.tar.xz"; \
+    wget --https-only --tries=5 --progress=dot:giga \
+        "https://sourceware.org/pub/binutils/releases/binutils-${BINUTILS_VERSION}.tar.xz" \
+        -O "binutils-${BINUTILS_VERSION}.tar.xz"; \
+    echo "${GCC_SHA512}  gcc-${GCC_VERSION}.tar.xz" | sha512sum -c -; \
+    echo "${BINUTILS_SHA512}  binutils-${BINUTILS_VERSION}.tar.xz" | sha512sum -c -; \
+    tar -xf "gcc-${GCC_VERSION}.tar.xz"; \
+    tar -xf "binutils-${BINUTILS_VERSION}.tar.xz"; \
+    rm \
+        "gcc-${GCC_VERSION}.tar.xz" \
+        "binutils-${BINUTILS_VERSION}.tar.xz"
+
+RUN mkdir -p /root/src/build-binutils
+
+WORKDIR /root/src/build-binutils
+
+RUN set -eux; \
+    "/root/src/binutils-${BINUTILS_VERSION}/configure" \
+        --target="${TARGET}" \
+        --prefix="${PREFIX}" \
+        --with-sysroot \
+        --disable-nls \
+        --disable-werror \
+        --enable-default-execstack=no
+
+RUN make -j"$(nproc)"
+RUN make install
+
+RUN set -eux; \
+    command -v "${TARGET}-as"; \
+    command -v "${TARGET}-ld"
+
+RUN mkdir -p /root/src/build-gcc
+
+WORKDIR /root/src/build-gcc
+
+RUN set -eux; \
+    "/root/src/gcc-${GCC_VERSION}/configure" \
+        --target="${TARGET}" \
+        --prefix="${PREFIX}" \
+        --disable-nls \
+        --enable-languages=c,c++ \
+        --without-headers \
+        --enable-initfini-array \
+        --disable-hosted-libstdcxx
+
+RUN make -j"$(nproc)" all-gcc
+RUN make -j"$(nproc)" all-target-libgcc
+RUN make -j"$(nproc)" all-target-libstdc++-v3
+RUN make install-gcc
+RUN make install-target-libgcc
+RUN make install-target-libstdc++-v3
+
+RUN set -eux; \
+    "${TARGET}-gcc" --version; \
+    "${TARGET}-g++" --version; \
+    "${TARGET}-as" --version; \
+    "${TARGET}-ld" --version; \
+    test -f "$("${TARGET}-gcc" -print-libgcc-file-name)"; \
+    test "$("${TARGET}-g++" -print-file-name=libstdc++.a)" != "libstdc++.a"; \
+    test "$("${TARGET}-g++" -print-file-name=libsupc++.a)" != "libsupc++.a"
+
+FROM --platform=linux/amd64 ${UBUNTU_IMAGE} AS toolchain
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG GCC_VERSION=15.2.0
+ARG BINUTILS_VERSION=2.45.1
+
+LABEL org.opencontainers.image.title="i686 ELF cross-toolchain" \
+      org.opencontainers.image.description="Freestanding GCC and Binutils cross-toolchain for i686 ELF kernel development" \
+      org.opencontainers.image.version="${GCC_VERSION}-${BINUTILS_VERSION}"
+
+ENV PREFIX=/opt/cross \
+    TARGET=i686-elf \
+    PATH=/opt/cross/bin:${PATH}
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libgmp10 \
+        libisl23 \
+        libmpc3 \
+        libmpfr6 \
+        libzstd1 \
+        make \
+        nasm \
+        zlib1g; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/cross /opt/cross
+
+# Non-root user (uid 1000 matches the usual host user, see --userns=keep-id)
+RUN set -eux; \
+    userdel -r ubuntu || true; \
+    useradd -m -u 1000 -s /bin/bash dev; \
+    mkdir -p /workspace; \
+    chown dev:dev /workspace
+
+WORKDIR /workspace
+
+RUN set -eux; \
+    i686-elf-gcc --version; \
+    i686-elf-g++ --version; \
+    i686-elf-as --version; \
+    i686-elf-ld --version; \
+    test -f "$(i686-elf-gcc -print-libgcc-file-name)"; \
+    test "$(i686-elf-g++ -print-file-name=libstdc++.a)" != "libstdc++.a"; \
+    test "$(i686-elf-g++ -print-file-name=libsupc++.a)" != "libsupc++.a"
+
+USER dev
+
+CMD ["/bin/bash"]
+
+FROM toolchain AS dev
+
+USER root
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+LABEL org.opencontainers.image.title="i686 ELF kernel development environment" \
+      org.opencontainers.image.description="Cross-toolchain, GRUB, QEMU, GDB and ISO creation utilities for i686 kernel development"
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        gdb \
+        grub-common \
+        grub-pc-bin \
+        mtools \
+        qemu-system-x86 \
+        xorriso; \
+    rm -rf /var/lib/apt/lists/*
+
+USER dev

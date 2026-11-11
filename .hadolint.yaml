@@ -1,0 +1,6 @@
+failure-threshold: warning
+ignored:
+  - DL3006   # false positive: image is referenced through ${UBUNTU_IMAGE}, which is pinned by digest
+  - DL3008   # apt packages are not version-pinned (base image is pinned by digest)
+  - DL3029   # --platform=linux/amd64 is intentional (cross-toolchain is built for amd64)
+  - DL3059   # separate RUNs are intentional: keeps the long GCC build steps independently cached

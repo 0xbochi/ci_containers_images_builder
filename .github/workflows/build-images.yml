@@ -1,0 +1,218 @@
+name: Build and push images
+
+on:
+  push:
+    branches: [main]
+    paths: ["*/*/**", ".github/workflows/build-images.yml", "scripts/**"]
+  pull_request:
+    paths: ["*/*/**", ".github/workflows/build-images.yml", "scripts/**"]
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "repo/tag to build (empty = all)"
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      images: ${{ steps.list.outputs.images }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: List images to build
+        id: list
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_IMAGE: ${{ github.event.inputs.image }}
+          PUSH_BASE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          all() { find . -mindepth 3 -maxdepth 3 -name Containerfile -not -path './.*' -not -path './scripts/*' | sed 's|^\./||; s|/Containerfile$||' | sort; }
+
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$INPUT_IMAGE" ]; then
+            names="$INPUT_IMAGE"
+          else
+            base=""
+            [ "$EVENT" = "push" ] && base="$PUSH_BASE"
+            [ "$EVENT" = "pull_request" ] && base="$PR_BASE"
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+               || ! git cat-file -e "$base" 2>/dev/null \
+               || git diff --name-only "$base" HEAD | grep -Eq '^(\.github|scripts)/'; then
+              names="$(all)"          # dispatch, first push, or workflow changed: build everything
+            else
+              names="$(git diff --name-only "$base" HEAD | sed -n 's|^\([^./][^/]*/[^/]*\)/.*|\1|p' | sort -u)"
+            fi
+          fi
+
+          json="$(for n in $names; do
+                    [ -f "$n/Containerfile" ] && jq -nc --arg r "${n%%/*}" --arg t "${n#*/}" '{repo:$r,tag:$t}'
+                  done | jq -sc .)"
+          echo "images=$json" >> "$GITHUB_OUTPUT"
+          echo "Images to build: $json"
+
+  lint:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Hadolint
+        run: |
+          set -euo pipefail
+          status=0
+          for f in $(find . -mindepth 3 -maxdepth 3 -name Containerfile -not -path './.*' -not -path './scripts/*'); do
+            echo "::group::hadolint $f"
+            docker run --rm -i -v "$PWD/.hadolint.yaml:/.hadolint.yaml:ro" hadolint/hadolint:v2.12.0 < "$f" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+  build:
+    needs: [detect, lint]
+    if: needs.detect.outputs.images != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.detect.outputs.images) }}
+    permissions:
+      contents: read
+    env:
+      PUSH: ${{ github.event_name != 'pull_request' }}
+      IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image.repo }}
+      DIR: ${{ matrix.image.repo }}/${{ matrix.image.tag }}
+      CACHE_REF: ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image.repo }}:buildcache-${{ matrix.image.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to Docker Hub
+        if: env.PUSH == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tags and OCI labels
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ matrix.image.tag }}
+            type=sha,prefix=${{ matrix.image.tag }}-,format=short
+
+      # 1. build into the local image store only (fills the registry cache)
+      - name: Build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ env.DIR }}
+          file: ${{ env.DIR }}/Containerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.CACHE_REF }}
+          cache-to: ${{ env.PUSH == 'true' && format('type=registry,ref={0},mode=max,image-manifest=true,oci-mediatypes=true', env.CACHE_REF) || '' }}
+
+      # 2. test the image before it can overwrite anything on Docker Hub
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          if [ -f "$DIR/smoke-test.sh" ]; then
+            first_tag="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
+            docker run --rm -v "$PWD/$DIR/smoke-test.sh:/smoke-test.sh:ro" "$first_tag" bash /smoke-test.sh
+          else
+            echo "No smoke-test.sh in $DIR, skipping"
+          fi
+
+      # 3. push (all layers come from the build cache)
+      - name: Push
+        if: env.PUSH == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ env.DIR }}
+          file: ${{ env.DIR }}/Containerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.CACHE_REF }}
+
+      - name: Record result
+        if: always() && env.PUSH == 'true'
+        env:
+          REPO: ${{ matrix.image.repo }}
+          TAG: ${{ matrix.image.tag }}
+          STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p results
+          jq -n --arg repo "$REPO" --arg tag "$TAG" --arg status "$STATUS" \
+                --arg date "$(date -u '+%Y-%m-%d %H:%M')" --arg sha "$GITHUB_SHA" --arg run_url "$RUN_URL" \
+                '{repo:$repo,tag:$tag,status:$status,date:$date,sha:$sha,run_url:$run_url}' \
+                > "results/${REPO}__${TAG}.json"
+
+      - name: Upload result
+        if: always() && env.PUSH == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: result-${{ matrix.image.repo }}-${{ matrix.image.tag }}
+          path: results/*.json
+
+  readme:
+    needs: build
+    if: always() && needs.build.result != 'skipped' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: readme-update
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: result-*
+          path: results
+          merge-multiple: true
+
+      - name: Regenerate README table
+        env:
+          NAMESPACE: ${{ vars.DOCKERHUB_USERNAME }}
+        run: python3 scripts/update_readme.py "$NAMESPACE" results
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md status.json
+          git diff --cached --quiet && exit 0
+          git commit -m "ci: update images status [skip ci]"
+          git pull --rebase origin main
+          git push origin main
