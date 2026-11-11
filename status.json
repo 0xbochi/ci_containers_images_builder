@@ -1,0 +1,10 @@
+{
+  "i686-elf-toolchain:gcc-15.2.0": {
+    "date": "2026-11-11 17:04",
+    "repo": "i686-elf-toolchain",
+    "run_url": "https://github.com/0xbochi/ci_containers_images_builder/actions/runs/43061779122",
+    "sha": "b7ddbd30d41af58c4fc6bca62c71a4912723564f",
+    "status": "success",
+    "tag": "gcc-15.2.0"
+  }
+}

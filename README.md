@@ -8,6 +8,9 @@ Builds container images with GitHub Actions and pushes them to Docker Hub.
 Table generated automatically by the CI after each build, do not edit by hand.
 
 <!-- IMAGES:START -->
+| Image | Tag | Docker Hub | Last build (UTC) | Status | Commit |
+|---|---|---|---|---|---|
+| `i686-elf-toolchain` | `gcc-15.2.0` | [lbochi/i686-elf-toolchain:gcc-15.2.0](https://hub.docker.com/r/lbochi/i686-elf-toolchain/tags?name=gcc-15.2.0) | 2026-11-11 17:04 | [✅ success](https://github.com/0xbochi/ci_containers_images_builder/actions/runs/43061779122) | `b7ddbd3` |
 <!-- IMAGES:END -->
 
 ## Layout
